@@ -1,150 +1,87 @@
-<p align="center">   <img src="assets/banner.svg" alt="CNN Accelerator Banner"/> </p>
+# CNN Convolution Accelerator (RTL)
 
+Một bộ tăng tốc phần cứng (hardware accelerator) cho phép tính tích chập (convolution) trong mạng CNN, thiết kế bằng RTL (Verilog/SystemVerilog), hướng đến ứng dụng Edge AI. Engine được tham số hóa (parameterizable) để có thể tái sử dụng cho nhiều layer / nhiều mô hình CNN khác nhau, thay vì cố định cho một kiến trúc mạng cụ thể.
 
-[![License](https://img.shields.io/badge/License-MIT/Apache%202.0-blue.svg)](#-license)
-[![Toolchain](https://img.shields.io/badge/Toolchain-Verilator%20|%20Yosys%20|%20nextpnr-orange.svg)](#-toolchain)
-[![FPGA](https://img.shields.io/badge/FPGA-Vendor--Agnostic-green.svg)](#-design-goals)
+## Mục tiêu dự án
 
-A high-throughput, streaming 3×3 convolution engine designed in pure Verilog RTL. This IP core is optimized for 128×128 grayscale edge-AI inference and is compatible with fully open-source FPGA toolchains.
+Thiết kế một **convolution engine 3×3** làm lõi tính toán trung tâm của một CNN accelerator, có khả năng:
 
----
+- Xử lý phép tích chập 3×3 với số input/output channel tùy chỉnh (tham số hóa runtime, không hard-code lúc tổng hợp)
+- Hỗ trợ **tiling**: xử lý feature map lớn hơn dung lượng buffer on-chip, có xử lý đúng vùng chồng lấp (halo) giữa các tile
+- Hỗ trợ **weight streaming**: nạp trọng số dần từ bộ nhớ ngoài khi weight của layer vượt quá buffer on-chip, kèm double buffering để giảm thời gian chờ
+- Tích hợp ReLU và quantization (INT8) ngay trong pipeline tính toán
 
-## 📌 Project Overview
+Đây là dự án cá nhân, thực hiện với mục tiêu học tập và làm portfolio kỹ thuật RTL design & verification, không nhằm mục đích thương mại hóa hay tape-out thực tế.
 
-This project implements a vendor-agnostic CNN acceleration block capable of serving as a standalone processing unit or the backbone for complex, task-aware detection pipelines (RISC-V/VEGA compatible).
+## Bài toán & Workload tham chiếu
 
-### 🎯 Design Goals
-* **⚡ High Throughput:** Streaming architecture achieving 1 pixel per clock cycle.
-* **💾 Resource Efficient:** Low FPGA footprint via BRAM-based line buffering.
-* **🧠 INT8 Quantized:** Optimized fixed-point inference (INT8 weights/data, INT32 accumulation).
-* **🔓 Open Source:** Designed for `Yosys`, `nextpnr`, and `Verilator`—no vendor lock-in.
-* **🧩 Scalable:** Parameterized RTL for easy adaptation to different image sizes or channel depths.
+Engine được kiểm thử và đánh giá hiệu năng bằng một mạng CNN classification nhỏ trên CIFAR-10:
 
----
-
-## 🏗 Accelerator Architecture
-
-The IP utilizes a classic line-buffer sliding window approach to maximize data reuse and minimize external memory bandwidth.
-
-
-
-### Pipeline Stages
-1.  **Input Stream:** 128×128×1 INT8 pixels.
-2.  **BRAM Line Buffer:** Stores 3 rows of the image to enable sliding window access.
-3.  **Sliding Window Generator:** Extracts 3×3 pixel neighborhoods every clock cycle.
-4.  **Parallel MAC Array:** 9 concurrent INT8 Multiply-Accumulate operations.
-5.  **ReLU Activation:** Zero-clipping for non-linearity.
-6.  **Output Quantization:** Scaling and bit-shifting back to INT8.
-
----
-
-## ⚙ Configuration Parameters
-
-The core is fully customizable via top-level parameters:
-
-| Parameter | Default | Description |
-| :--- | :--- | :--- |
-| `DATA_WIDTH` | 8 | Input feature map bit-width |
-| `WEIGHT_WIDTH` | 8 | Kernel weight bit-width |
-| `ACC_WIDTH` | 32 | Intermediate accumulation width |
-| `IMG_WIDTH` | 128 | Image width (adjustable) |
-| `KERNEL_SIZE` | 3 | Supported kernel size |
-| `OUT_CHANNELS`| 8 | Number of output filters |
-
----
-
-## 🧮 Data Precision & Performance
-
-To avoid costly floating-point logic, we utilize a hardware-friendly quantization formula:
-
-$$output = (accumulator \times scale) \gg shift$$
-
-### 📊 Performance Targets (at 100 MHz)
-* **Total Pixels:** 16,384
-* **Throughput:** ~163 µs per output channel
-* **Clock Speed:** Target 100 MHz on Lattice ECP5 / iCE40 or Xilinx/Intel equivalents.
-* **Efficiency:** 20× – 200× speedup over software-only CPU inference.
-
----
-
-## 🔌 Interface
-The IP uses a simple streaming interface, making it easy to wrap with AXI-Stream for SoC integration.
-
-```verilog
-input  logic clk;
-input  logic rst_n; 
-
-// Giao diện cấu hình & nạp Trọng số (Có thể dùng AXI-Lite hoặc stream riêng)
-input  logic weight_valid;
-output logic weight_ready;
-input  logic [DATA_WIDTH-1:0] weight_data;
-
-// Input Stream (Dành cho Activations / Ma trận dữ liệu đầu vào)
-input  logic input_valid;
-output logic input_ready;  // <--- THÊM: Báo cho DMA biết IP đã sẵn sàng nhận
-input  logic input_last;   // <--- THÊM: Báo hiệu kết thúc 1 hàng/1 feature map
-input  logic [DATA_WIDTH-1:0] input_data;
-
-// Output Stream (Dành cho Kết quả Convolution)
-output logic output_valid;
-input  logic output_ready; // <--- THÊM: Báo cho IP biết hệ thống nhận đã sẵn sàng
-output logic output_last;  // <--- THÊM: Báo hiệu xuất xong 1 block kết quả
-output logic [DATA_WIDTH-1:0] output_data;
 ```
-# 🚀 CNN Accelerator IP Development Roadmap
-
-## 🗓 Development Schedule
-
-### 📅 Week 1: Core Arithmetic
-- [ ] Implement **INT8 MAC** units.
-- [ ] Design **INT32 accumulator** logic.
-- [ ] Basic unit testbench for fixed-point validation.
-
-### 📅 Week 2: Memory & Flow
-- [ ] **BRAM Line Buffer** implementation.
-- [ ] Sliding window generator logic.
-- [ ] Full pipeline integration.
-
-### 📅 Week 3: Optimization
-- [ ] **ReLU & Quantization** block.
-- [ ] Timing closure and critical path analysis.
-- [ ] Resource utilization reports.
-
-### 📅 Week 4: Deployment
-- [ ] Full synthesis with open-source tools.
-- [ ] Benchmark publication.
-- [ ] Task-aware hardware extension draft.
-
----
-
-## 🛠 Toolchain Support
-This project intentionally avoids proprietary IP cores to ensure compatibility with an entirely open-source flow:
-* **Simulation:** [Verilator](https://www.veripool.org/verilator/)
-* **Synthesis:** [Yosys](https://yosyshq.net/yosys/)
-* **Place & Route:** [nextpnr](https://github.com/YosysHQ/nextpnr)
-
----
-
-## 📁 Repository Structure
-```plaintext
-cnn-accelerator-ip/
-├── rtl/                # Verilog RTL modules
-├── tb/                 # Testbenches (Verilator / CocoTB)
-├── synthesis/          # Synthesis scripts (Yosys)
-├── docs/               # Technical documentation
-└── progress_logs/      # Weekly updates
+Input: 32x32x3 (CIFAR-10)
+Conv1: 3x3, 3→16 channels, stride 1, pad 1  → ReLU → MaxPool 2x2
+Conv2: 3x3, 16→32 channels, stride 1, pad 1 → ReLU → MaxPool 2x2
+Conv3: 3x3, 32→64 channels, stride 1, pad 1 → ReLU → MaxPool 2x2
+FC1: 64*4*4 → 128 → ReLU
+FC2: 128 → 10 (classify)
 ```
-# 📜 License
-This project is dual-licensed under the **MIT** and **Apache 2.0 License**. You may choose the license that best fits your project needs. See the `LICENSE` file for the full text.
 
----
+Model được train bằng PyTorch, sau đó quantize về INT8 để phù hợp với engine phần cứng.
 
-# 🔮 Vision
-To empower edge devices with **lightweight, high-performance, and open-source AI hardware** that bridges the gap between raw data and task-aware intelligence.
+## Kiến trúc tổng quan
 
+Engine xử lý tuần tự theo từng output channel, cộng dồn kết quả qua các input channel. Các khối chính:
 
+| Khối | Chức năng |
+|---|---|
+| Line Buffer & Window Generator | Giữ 3 hàng feature map, trích cửa sổ 3×3 mỗi chu kỳ, xử lý padding biên |
+| PE Array (9 PE) | 9 phép nhân-cộng INT8 song song cho một cửa sổ 3×3 |
+| Channel Accumulator | Cộng dồn partial sum qua input channel, hỗ trợ read-modify-write khi cần tiling |
+| ReLU | Cắt giá trị âm |
+| Quantizer | Scale + shift kết quả 32-bit về lại INT8, tham số theo từng layer |
+| Tiling Controller | Chia feature map lớn thành tile, quản lý vùng overlap (halo) |
+| Weight Buffer & Streaming | Nạp weight on-chip, double buffering khi weight lớn hơn buffer |
+| Top-level FSM | Điều phối toàn bộ pipeline, đọc tham số runtime (C_in, C_out, H, W, tile size...) |
 
-We believe in a future where:
-* **Edge AI** is accessible without proprietary vendor lock-in.
-* **Hardware-Software co-design** is transparent and verifiable.
-* **Low-power acceleration** enables sophisticated defect detection and computer vision on the smallest silicon footprints.
+*(Sơ đồ khối chi tiết sẽ được cập nhật trong thư mục `docs/`.)*
+
+## Công cụ & Flow
+
+- **RTL**: SystemVerilog
+- **Verification**: Testbench SystemVerilog, so khớp kết quả từng layer với golden model tham chiếu
+- **Golden model**: Python (PyTorch + NumPy), mô phỏng bit-accurate phép tính INT8
+- **Tổng hợp mã nguồn mở**: Yosys, đánh giá area/timing với OpenROAD + SKY130 PDK
+
+## Trạng thái dự án
+
+- [ ] Golden model (Python) cho toàn bộ pipeline conv + ReLU + quantize
+- [ ] RTL: PE Array
+- [ ] RTL: Channel Accumulator
+- [ ] RTL: Line Buffer / Window Generator (có padding)
+- [ ] RTL: Quantizer
+- [ ] RTL: Top-level Controller FSM
+- [ ] RTL: Tiling & Weight Streaming
+- [ ] Verification: testbench so khớp golden model
+- [ ] Tổng hợp thử với Yosys/OpenROAD (SKY130)
+- [ ] Đánh giá hiệu năng: throughput, latency, ước lượng power/area
+
+## Cấu trúc thư mục (dự kiến)
+
+```
+.
+├── rtl/            # Mã nguồn SystemVerilog
+├── tb/             # Testbench
+├── model/          # Golden model Python, script train/quantize
+├── sim/            # Script mô phỏng, kịch bản test
+├── synth/          # Script tổng hợp Yosys/OpenROAD
+├── docs/           # Sơ đồ khối, ghi chú thiết kế
+└── README.md
+```
+
+## Ghi chú
+
+Dự án đang trong quá trình phát triển. README sẽ được cập nhật khi có kết quả cụ thể (waveform, số liệu tổng hợp, so sánh hiệu năng).
+
+## Tác giả
+
+Sinh viên ngành [Kỹ thuật máy tính/Điện tử], hướng chuyên môn RTL Design & Verification.
