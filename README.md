@@ -71,16 +71,25 @@ $$output = (accumulator \times scale) \gg shift$$
 The IP uses a simple streaming interface, making it easy to wrap with AXI-Stream for SoC integration.
 
 ```verilog
-input clk;
-input rst;
+input  logic clk;
+input  logic rst_n; 
 
-// Input Stream
-input input_valid;
-input [DATA_WIDTH-1:0] input_data;
+// Giao diện cấu hình & nạp Trọng số (Có thể dùng AXI-Lite hoặc stream riêng)
+input  logic weight_valid;
+output logic weight_ready;
+input  logic [DATA_WIDTH-1:0] weight_data;
 
-// Output Stream
-output output_valid;
-output [DATA_WIDTH-1:0] output_data;
+// Input Stream (Dành cho Activations / Ma trận dữ liệu đầu vào)
+input  logic input_valid;
+output logic input_ready;  // <--- THÊM: Báo cho DMA biết IP đã sẵn sàng nhận
+input  logic input_last;   // <--- THÊM: Báo hiệu kết thúc 1 hàng/1 feature map
+input  logic [DATA_WIDTH-1:0] input_data;
+
+// Output Stream (Dành cho Kết quả Convolution)
+output logic output_valid;
+input  logic output_ready; // <--- THÊM: Báo cho IP biết hệ thống nhận đã sẵn sàng
+output logic output_last;  // <--- THÊM: Báo hiệu xuất xong 1 block kết quả
+output logic [DATA_WIDTH-1:0] output_data;
 ```
 # 🚀 CNN Accelerator IP Development Roadmap
 
