@@ -46,9 +46,9 @@ Dự án đã cân nhắc qua 3 hướng trước khi chốt phương án cuối
 ### Nguyên lý dataflow: Weight-Stationary, song song hóa theo Channel
 
 ```
-                    Input Feature Stream (broadcast / shifted)
-                         |        |        |        |
-                         v        v        v        v
+               Input Feature Stream (broadcast / shifted)
+                   |        |        |        |
+                   v        v        v        v
               +--------------------------------------+
 Weight Reg -- | PE(0,0)   PE(0,1)   ...    PE(0,N)    | ---> pSum Accumulator (output channel 0)
               +--------------------------------------+
