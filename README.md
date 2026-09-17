@@ -30,18 +30,18 @@ Model được train bằng PyTorch, sau đó quantize về INT8 để phù hợ
 
 ## Kiến trúc tổng quan
 
-Engine xử lý tuần tự theo từng output channel, cộng dồn kết quả qua các input channel. Các khối chính:
+Lõi tính toán (compute core) được thiết kế theo kiến trúc **Systolic Array** (weight-stationary), cùng loại kiến trúc dùng trong Google TPU — thay vì một PE array tính trực tiếp cửa sổ 3×3, phép tích chập được biến đổi về dạng nhân ma trận (kỹ thuật **im2col**) rồi đẩy qua lưới PE 2D, dữ liệu chảy tuần tự giữa các PE lân cận theo từng chu kỳ nhịp.
 
 | Khối | Chức năng |
 |---|---|
-| Line Buffer & Window Generator | Giữ 3 hàng feature map, trích cửa sổ 3×3 mỗi chu kỳ, xử lý padding biên |
-| PE Array (9 PE) | 9 phép nhân-cộng INT8 song song cho một cửa sổ 3×3 |
-| Channel Accumulator | Cộng dồn partial sum qua input channel, hỗ trợ read-modify-write khi cần tiling |
-| ReLU | Cắt giá trị âm |
+| Line Buffer & Window Generator + im2col | Giữ 3 hàng feature map, trích cửa sổ 3×3, duỗi thành vector phẳng (im2col) làm input cho systolic array |
+| Systolic Array (N×N PE, weight-stationary) | Lưới PE 2D, mỗi PE giữ cố định 1 giá trị weight, input chảy ngang, partial sum chảy dọc |
+| Weight Loading Path | Nạp weight vào đúng từng PE trong lưới trước khi bắt đầu tính (qua shift register theo hàng/đường chéo) |
+| ReLU | Cắt giá trị âm, áp dụng ở output của lưới systolic |
 | Quantizer | Scale + shift kết quả 32-bit về lại INT8, tham số theo từng layer |
-| Tiling Controller | Chia feature map lớn thành tile, quản lý vùng overlap (halo) |
-| Weight Buffer & Streaming | Nạp weight on-chip, double buffering khi weight lớn hơn buffer |
-| Top-level FSM | Điều phối toàn bộ pipeline, đọc tham số runtime (C_in, C_out, H, W, tile size...) |
+| Tiling Controller | Chia feature map lớn thành tile, quản lý vùng overlap (halo) — *giai đoạn nâng cao* |
+| Weight Buffer & Streaming | Nạp weight on-chip, double buffering khi weight lớn hơn buffer — *giai đoạn nâng cao* |
+| Top-level FSM | Điều phối toàn bộ pipeline: nạp weight vào lưới, chạy dữ liệu qua, tính đúng độ trễ (latency) trước khi đọc output |
 
 *(Sơ đồ khối chi tiết sẽ được cập nhật trong thư mục `docs/`.)*
 
@@ -49,40 +49,44 @@ Engine xử lý tuần tự theo từng output channel, cộng dồn kết quả
 
 Đặc tả chi tiết từng khối, dùng làm checklist thiết kế RTL. Thứ tự implement khuyến nghị: PE Array → Accumulator → Line Buffer/Window → Quantizer → Controller FSM → Weight Streaming → Tiling.
 
-### 1. Line Buffer & Window Generator
+### 1. Line Buffer, Window Generator & im2col
 
 **Chức năng:**
 - Lưu 3 hàng gần nhất của feature map (1 channel tại 1 thời điểm) để tạo cửa sổ trượt 3×3
 - Sau mỗi chu kỳ xung nhịp, trích ra 1 cửa sổ 3×3 mới khi input dịch chuyển sang phải 1 pixel
 - Xử lý padding: khi cửa sổ chạm biên ảnh/tile, chèn giá trị 0 thay vì đọc dữ liệu ngoài vùng hợp lệ
+- **im2col**: duỗi cửa sổ 3×3×C_in thành 1 vector phẳng (9×C_in phần tử) để đưa vào systolic array dưới dạng "hàng input" của phép nhân ma trận
 
 **Cần làm:**
 - Buffer 3×W (W lấy từ `cfg_w`, dùng shift register hoặc dual-port BRAM tùy độ rộng ảnh tối đa hỗ trợ)
 - Logic phát hiện vị trí biên (row đầu/cuối, col đầu/cuối) dựa theo `cfg_h`, `cfg_w`, `cfg_pad_en`
-- Output: cửa sổ 3×3 (9 giá trị INT8) + tín hiệu valid khi cửa sổ sẵn sàng
+- Logic sắp xếp lại thứ tự phần tử cửa sổ 3×3×C_in thành vector đúng thứ tự khớp với cách weight được nạp vào lưới PE (thứ tự này phải nhất quán giữa im2col và weight loading)
+- Output: vector input + tín hiệu valid khi vector sẵn sàng đẩy vào lưới
 
-### 2. PE Array (9 PE cố định)
-
-**Chức năng:**
-- Nhận 1 cửa sổ 3×3 (9 giá trị input) và 1 kernel 3×3 (9 giá trị weight) cùng lúc
-- Thực hiện 9 phép nhân INT8×INT8 song song, sau đó cộng lại thành 1 giá trị partial sum (dùng adder tree, không cộng tuần tự để tránh delay dài)
-
-**Cần làm:**
-- 9 multiplier 8-bit×8-bit → kết quả 16-bit
-- Adder tree 3 tầng (9 input → gộp dần → 1 output), độ rộng kết quả đủ lớn để không tràn (tối thiểu 20-bit)
-- Thiết kế thuần tổ hợp (combinational) hoặc pipeline 1-2 tầng tùy yêu cầu tần số hoạt động
-
-### 3. Channel Accumulator
+### 2. Systolic Array (N×N PE, Weight-Stationary)
 
 **Chức năng:**
-- Cộng dồn partial sum từ PE Array qua từng input channel (vòng lặp `ic` trong `C_in`)
-- Khi xử lý xong toàn bộ input channel cho 1 output pixel, cộng thêm bias rồi chuyển kết quả sang ReLU
-- Hỗ trợ trường hợp tiling: nếu input channel bị chia nhỏ qua nhiều lượt xử lý (do tile), phải đọc lại partial sum đã lưu trước đó từ bộ nhớ ngoài, cộng thêm giá trị mới, rồi ghi lại (read-modify-write) thay vì chỉ cộng dồn trong thanh ghi nội bộ
+- Lưới PE 2D kích thước N×N (khuyến nghị bắt đầu N=8, có thể tăng lên 16 nếu tổng hợp ổn)
+- Mỗi PE giữ cố định 1 giá trị weight trong suốt quá trình tính của 1 layer/1 lượt
+- Input chảy theo hàng ngang (trái → phải), partial sum chảy theo cột dọc (trên → dưới)
+- Mỗi PE thực hiện: `partial_sum_out = partial_sum_in + input_in × weight_stored`, rồi đẩy `input_in` sang phải, đẩy `partial_sum_out` xuống dưới
 
 **Cần làm:**
-- Thanh ghi tích lũy 32-bit, reset về 0 khi bắt đầu 1 output pixel mới (dựa theo bộ đếm `ic` chạy hết `cfg_c_in`)
-- Cộng bias ở bước cuối cùng của vòng lặp input channel
-- Interface đọc/ghi partial sum ra bộ nhớ ngoài cho trường hợp tiling (có thể làm ở giai đoạn sau, chưa cần ngay ở bản đầu tiên)
+- 1 module PE cơ bản: 1 thanh ghi giữ weight, 1 multiplier INT8×INT8, 1 adder, 2 thanh ghi pipeline (đẩy input sang phải, đẩy partial sum xuống dưới) — module này sẽ được **instance N×N lần**
+- Kết nối lưới N×N theo đúng mô hình systolic (chỉ nối với hàng xóm liền kề, không có kết nối chéo/toàn cục)
+- Định thời (timing) để dữ liệu input được đưa vào lệch nhau theo hàng (staggered/skewed input) — đây là điểm dễ sai nhất khi RTL hóa systolic array, cần vẽ giản đồ thời gian rõ ràng trước khi code
+- Output: partial sum đầy đủ xuất hiện ở hàng cuối lưới sau đúng số chu kỳ độ trễ (latency) bằng kích thước lưới
+
+### 3. Weight Loading Path
+
+**Chức năng:**
+- Nạp giá trị weight vào đúng từng PE trong lưới N×N trước khi bắt đầu đẩy dữ liệu input vào tính toán
+- Với weight-stationary, việc nạp này chỉ cần làm 1 lần cho mỗi lượt tính (mỗi output channel hoặc mỗi nhóm output channel tùy cách ánh xạ), không nạp lại liên tục như input
+
+**Cần làm:**
+- Đường nạp weight riêng (có thể dùng chính `weight_data` chảy qua theo shift-register dọc theo từng cột hoặc hàng của lưới, giống cách input chảy nhưng ở chế độ "load")
+- Bộ đếm để biết đã nạp đủ N×N giá trị weight hay chưa trước khi chuyển FSM sang trạng thái tính toán
+- Quyết định rõ cách ánh xạ: 1 lưới N×N ứng với bao nhiêu input channel / output channel cùng lúc (ví dụ lưới 8×8 có thể ánh xạ 8 input channel × 8 output channel tại 1 thời điểm, cần thêm vòng lặp bên ngoài nếu C_in/C_out > 8)
 
 ### 4. ReLU
 
@@ -160,14 +164,18 @@ Engine xử lý tuần tự theo từng output channel, cộng dồn kết quả
 
 ---
 
-**Gợi ý thứ tự làm việc thực tế:**
+**Gợi ý thứ tự làm việc thực tế (đã điều chỉnh cho kiến trúc Systolic Array):**
 
-1. Viết golden model Python trước (numpy, bit-accurate INT8) — dùng làm reference cho toàn bộ các bước sau
-2. RTL hóa khối 2 → 3 → 4 → 5 (PE Array → Accumulator → ReLU → Quantizer) và ghép test với 1 output pixel đơn lẻ trước, chưa cần buffer/FSM đầy đủ
-3. Thêm khối 1 (Line Buffer/Window) để tự động tạo input cho khối trên theo cả feature map
-4. Thêm khối 9 + 10 (Controller FSM + Config) để chạy tự động qua nhiều output channel, nhiều input channel
-5. Thêm khối 6 (Weight Streaming) khi weight vượt buffer
-6. Thêm khối 7, 8 (Loop order + Tiling) sau cùng — đây là phần nâng cao, có thể để làm ở giai đoạn 2 nếu thời gian hạn chế
+1. Viết golden model Python trước (numpy, bit-accurate INT8), bao gồm cả bước im2col — dùng làm reference cho toàn bộ các bước sau
+2. RTL hóa **1 PE đơn lẻ** trước, verify đúng phép nhân-cộng-đẩy dữ liệu cơ bản
+3. Ghép PE thành lưới nhỏ (ví dụ 2×2) để verify đúng cơ chế dữ liệu chảy (data flow) và độ trễ (latency) trước khi mở rộng lên N×N thật — đây là bước quan trọng để bắt lỗi timing sớm, tránh debug lưới lớn ngay từ đầu rất khó
+4. Mở rộng lên lưới N×N đầy đủ (Systolic Array) + Weight Loading Path
+5. Thêm Line Buffer/Window Generator + im2col để tạo input tự động từ cả feature map thay vì vector cố định
+6. Thêm ReLU + Quantizer nối sau output của lưới
+7. Thêm Top-level FSM + Config Interface để chạy tự động qua nhiều output channel, nhiều input channel, nhiều layer
+8. *(Nâng cao — làm nếu còn thời gian)* Weight Streaming, Tiling Controller, Loop Order tối ưu
+
+**Lưu ý về scope:** vì Systolic Array đã là phần tăng độ khó đáng kể so với thiết kế PE tuần tự ban đầu, khuyến nghị **ưu tiên làm đúng và verify kỹ bước 1-7**, xem bước 8 (tiling, weight streaming nâng cao) là phần mở rộng tùy thời gian còn lại — không bắt buộc để có một sản phẩm hoàn chỉnh trình bày được.
 
 ## Công cụ & Flow
 
