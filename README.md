@@ -1,21 +1,19 @@
-# CNN Convolution Accelerator (RTL)
+# CNN Accelerator IP Core (RTL)
 
-Một bộ tăng tốc phần cứng (hardware accelerator) cho phép tính tích chập (convolution) trong mạng CNN, thiết kế bằng RTL (Verilog/SystemVerilog), hướng đến ứng dụng Edge AI. Engine được tham số hóa (parameterizable) để có thể tái sử dụng cho nhiều layer / nhiều mô hình CNN khác nhau, thay vì cố định cho một kiến trúc mạng cụ thể.
+IP core phần cứng tăng tốc tính toán cho mạng CNN (Conv + Fully-Connected), thiết kế bằng SystemVerilog, hướng đến Edge AI/NPU cỡ nhỏ. Lõi tính toán dùng chung 1 mảng MAC cho cả lớp Conv lẫn FC, giao tiếp qua chuẩn AXI4.
 
-## Mục tiêu dự án
+## Mục tiêu
 
-Thiết kế một **convolution engine 3×3** làm lõi tính toán trung tâm của một CNN accelerator, có khả năng:
+Thiết kế một **MAC Array song song hóa theo channel, weight-stationary**, dùng chung cho cả Convolution và Fully-Connected — không cần 2 khối phần cứng riêng biệt:
 
-- Xử lý phép tích chập 3×3 với số input/output channel tùy chỉnh (tham số hóa runtime, không hard-code lúc tổng hợp)
-- Hỗ trợ **tiling**: xử lý feature map lớn hơn dung lượng buffer on-chip, có xử lý đúng vùng chồng lấp (halo) giữa các tile
-- Hỗ trợ **weight streaming**: nạp trọng số dần từ bộ nhớ ngoài khi weight của layer vượt quá buffer on-chip, kèm double buffering để giảm thời gian chờ
-- Tích hợp ReLU và quantization (INT8) ngay trong pipeline tính toán
+- Xử lý Conv 3×3 (và mở rộng được cho kernel size khác) với C_in/C_out tùy chỉnh runtime
+- Xử lý FC layer bằng chính mảng MAC đó (FC = trường hợp đặc biệt của conv với kernel size 1)
+- Tận dụng nguyên lý weight-stationary để giảm năng lượng đọc SRAM (đọc SRAM tốn năng lượng gấp nhiều lần so với 1 phép nhân 8-bit)
+- Giao tiếp chuẩn hóa qua AXI4-Lite (config) và AXI4-Stream (data/weight/output)
 
-Đây là dự án cá nhân, thực hiện với mục tiêu học tập và làm portfolio kỹ thuật RTL design & verification, không nhằm mục đích thương mại hóa hay tape-out thực tế.
+Dự án cá nhân, mục tiêu học tập và portfolio kỹ thuật RTL design & verification.
 
 ## Bài toán & Workload tham chiếu
-
-Engine được kiểm thử và đánh giá hiệu năng bằng một mạng CNN classification nhỏ trên CIFAR-10:
 
 ```
 Input: 32x32x3 (CIFAR-10)
@@ -26,149 +24,181 @@ FC1: 64*4*4 → 128 → ReLU
 FC2: 128 → 10 (classify)
 ```
 
-Model được train bằng PyTorch, sau đó quantize về INT8 để phù hợp với engine phần cứng.
+Model train bằng PyTorch, quantize về INT8 để khớp với engine phần cứng.
 
-## Kiến trúc tổng quan
+## Quá trình đưa ra quyết định kiến trúc
 
-Engine xử lý tuần tự theo từng output channel, cộng dồn kết quả qua các input channel. Các khối chính:
+Dự án đã cân nhắc qua 3 hướng trước khi chốt phương án cuối:
+
+| Tiêu chí | 9-PE Spatial Convolver (thử đầu tiên) | Systolic Array 2D thuần / GEMM qua im2col (thử thứ hai) | **Channel-Parallel Weight-Stationary MAC Array (chốt)** |
+|---|---|---|---|
+| Khả năng chạy Conv 3×3 | Tốt | Rất tốt (qua im2col) | Rất tốt |
+| Khả năng chạy FC | **Liệt hoàn toàn** — gắn chết với cửa sổ 3×3 | Chạy được nhưng cần thêm biến đổi | Tận dụng 100% cùng phần cứng, không cần khối riêng |
+| Độ phức tạp FSM/control | Trung bình | Rất phức tạp (skewing, address generation) | Vừa phải, ánh xạ trực quan |
+| Hiệu suất sử dụng PE | 100% cho đúng 3×3, kém cho kernel khác | Thấp nếu C_in/C_out lẻ | Cao, linh hoạt theo kernel size |
+| Tối ưu năng lượng | Tốn công đọc line-buffer liên tục | Tối ưu truyền nội bộ nhưng phức tạp | Tối ưu nhờ weight-stationary (giảm truy xuất SRAM) |
+| Phù hợp quy mô IP core gọn (dễ timing closure trên SKY130) | Được | Quá cồng kềnh cho Edge AI | Phù hợp nhất |
+
+**Lý do chốt phương án 3**: đây là kiến trúc duy nhất giải quyết được đồng thời cả Conv và FC bằng chung 1 phần cứng, không phải trả giá về data duplication (im2col) hay độ phức tạp timing (skewing) như phương án Systolic-GEMM, đồng thời quy mô đủ gọn để khả thi tổng hợp/timing closure trong phạm vi đồ án. Chi tiết 2 phương án đã thử (bao gồm RTL của Systolic-GEMM + skew) được giữ lại tại `docs/explored/` làm tài liệu so sánh.
+
+## Kiến trúc
+
+### Nguyên lý dataflow: Weight-Stationary, song song hóa theo Channel
+
+```
+                    Input Feature Stream (broadcast / shifted)
+                         |        |        |        |
+                         v        v        v        v
+              +--------------------------------------+
+Weight Reg -- | PE(0,0)   PE(0,1)   ...    PE(0,N)    | ---> pSum Accumulator (output channel 0)
+              +--------------------------------------+
+Weight Reg -- | PE(1,0)   PE(1,1)   ...    PE(1,N)    | ---> pSum Accumulator (output channel 1)
+              +--------------------------------------+
+              |   ...        ...            ...      |
+              +--------------------------------------+
+Weight Reg -- | PE(M,0)   PE(M,1)   ...    PE(M,N)    | ---> pSum Accumulator (output channel M)
+              +--------------------------------------+
+```
+
+- **Chiều M (hàng)**: song song hóa theo **output channel** (`C_out`)
+- **Chiều N (cột)**: song song hóa theo **input channel** (`C_in`) hoặc spatial pixel, tùy giai đoạn
+- **Weight-stationary**: mỗi PE giữ cố định 1 giá trị weight trong thanh ghi nội bộ suốt 1 lượt tính; input (activation) được truyền quét qua mảng để nhân với các weight này — 1 giá trị input được tái sử dụng đồng thời cho nhiều output channel (giảm mạnh số lần đọc SRAM)
+- **Kernel 3×3 xử lý bằng cách lặp tuần tự 9 tap**: với mỗi vị trí kernel (kx, ky) trong 9 tap, nạp bộ weight tương ứng, chạy 1 lượt qua mảng, cộng dồn kết quả vào accumulator — sau 9 lượt, output pixel hoàn tất. Với FC (kernel size = 1), chỉ cần 1 lượt duy nhất, dùng chung mảng và accumulator này.
+- Nếu `C_in`/`C_out` của layer lớn hơn kích thước vật lý M×N của mảng, chạy nhiều lượt tuần tự (time-multiplexing), cộng dồn thêm vào accumulator.
+
+### Kích thước mảng đề xuất
+
+Mảng MAC **4×4 hoặc 4×8** (INT8) — quy mô đủ nhỏ để khả thi đóng timing ~150–200 MHz trên SKY130 qua OpenROAD, không thiếu hụt diện tích khi route, phù hợp phạm vi đồ án hơn so với mảng lớn 16×16/32×32 kiểu TPU.
+
+### Sơ đồ khối tổng thể
+
+```
+Input Buffer (SRAM 2-port, layout NHWC/CHW) ──┐
+                                                ▼
+Line Buffer & Window Generator (Conv) ─── MAC Array (M×N, weight-stationary)
+   (bỏ qua/bypass khi chạy FC)                 │
+                                                ▼
+Weight Buffer (Ping-Pong SRAM) ──────►    pSum Accumulator
+                                                │
+                                                ▼
+                                         ReLU → Quantizer
+                                                │
+                                                ▼
+                                         Output Buffer / AXI4-Stream
+```
 
 | Khối | Chức năng |
 |---|---|
-| Line Buffer & Window Generator | Giữ 3 hàng feature map, trích cửa sổ 3×3 mỗi chu kỳ, xử lý padding biên |
-| PE Array (9 PE) | 9 phép nhân-cộng INT8 song song cho một cửa sổ 3×3 |
-| Channel Accumulator | Cộng dồn partial sum qua input channel, hỗ trợ read-modify-write khi cần tiling |
+| Input Buffer (SRAM 2-port) | Lưu feature map/activation theo layout channel (NHWC hoặc CHW tùy bus width) |
+| Line Buffer & Window Generator | Sinh cửa sổ 3×3×C_in mỗi bước cho Conv; bypass khi chạy FC (input đọc thẳng dạng vector) |
+| MAC Array (M×N, weight-stationary) | Lõi tính toán dùng chung cho Conv và FC, lặp tuần tự theo tap kernel |
+| Weight Buffer (Ping-Pong) | Chứa block weight INT8, double buffering để nạp trước weight lượt kế tiếp |
+| pSum Accumulator | Cộng dồn qua các tap kernel và các lượt time-multiplexing channel |
 | ReLU | Cắt giá trị âm |
-| Quantizer | Scale + shift kết quả 32-bit về lại INT8, tham số theo từng layer |
-| Tiling Controller | Chia feature map lớn thành tile, quản lý vùng overlap (halo) |
-| Weight Buffer & Streaming | Nạp weight on-chip, double buffering khi weight lớn hơn buffer |
-| Top-level FSM | Điều phối toàn bộ pipeline, đọc tham số runtime (C_in, C_out, H, W, tile size...) |
-
-*(Sơ đồ khối chi tiết sẽ được cập nhật trong thư mục `docs/`.)*
+| Quantizer | Scale + shift về lại INT8, tham số theo từng layer |
+| Tiling Controller | Chia feature map lớn thành tile, quản lý overlap (halo) — *giai đoạn nâng cao* |
+| Top-level FSM | Điều phối toàn bộ: load config, load weight, chạy tap/channel loop, đồng bộ AXI4 |
+| AXI4-Lite Config Interface | Thanh ghi cấu hình: `K_size`, `Stride`, `C_in`, `C_out`, `Scale`, `Shift`, `Pad_en` |
+| AXI4-Stream Data Interface | Nạp input/weight, xuất output dạng stream |
 
 ## Đặc tả chức năng phần cứng
 
-Đặc tả chi tiết từng khối, dùng làm checklist thiết kế RTL. Thứ tự implement khuyến nghị: PE Array → Accumulator → Line Buffer/Window → Quantizer → Controller FSM → Weight Streaming → Tiling.
+### 1. MAC Array (M×N PE)
+- Mỗi PE: 1 multiplier INT8×INT8 + 1 adder, giữ 1 giá trị weight cố định trong thanh ghi nội bộ suốt 1 lượt tính (nạp qua Weight Loading Path trước khi compute)
+- Input broadcast/shift tới các PE theo hàng hoặc cột tùy ánh xạ (không cần skew phức tạp như thiết kế systolic-GEMM)
+- Với Conv: lặp 9 lần (từng tap kernel 3×3), mỗi lần dùng 1 bộ weight khác nạp vào PE, cộng dồn vào pSum Accumulator
+- Với FC: chạy 1 lượt duy nhất, kernel size = 1, dùng chung accumulator
 
-### 1. Line Buffer & Window Generator
+### 2. Weight Buffer (Ping-Pong)
+- 2 buffer luân phiên: buffer A đang cấp weight cho MAC Array tính, buffer B nạp trước weight của tap/lượt kế tiếp từ AXI4-Stream
+- Giảm thời gian chờ giữa các lượt tap/channel
 
-**Chức năng:**
-- Lưu 3 hàng gần nhất của feature map (1 channel tại 1 thời điểm) để tạo cửa sổ trượt 3×3
-- Sau mỗi chu kỳ xung nhịp, trích ra 1 cửa sổ 3×3 mới khi input dịch chuyển sang phải 1 pixel
-- Xử lý padding: khi cửa sổ chạm biên ảnh/tile, chèn giá trị 0 thay vì đọc dữ liệu ngoài vùng hợp lệ
+### 3. Line Buffer & Window Generator (chỉ dùng cho Conv)
+- Giữ 3 hàng feature map, sinh cửa sổ 3×3×C_in mỗi bước
+- Xử lý padding biên theo `Pad_en`
+- Bypass khối này khi FSM ở chế độ FC (input đọc thẳng từ Input Buffer dạng vector, không cần cửa sổ trượt)
 
-**Cần làm:**
-- Buffer 3×W (W lấy từ `cfg_w`, dùng shift register hoặc dual-port BRAM tùy độ rộng ảnh tối đa hỗ trợ)
-- Logic phát hiện vị trí biên (row đầu/cuối, col đầu/cuối) dựa theo `cfg_h`, `cfg_w`, `cfg_pad_en`
-- Output: cửa sổ 3×3 (9 giá trị INT8) + tín hiệu valid khi cửa sổ sẵn sàng
+### 4. pSum Accumulator
+- Cộng dồn kết quả qua 9 tap kernel (Conv) hoặc qua các lượt time-multiplexing khi C_in/C_out > kích thước vật lý mảng
+- Cộng bias ở lượt cuối cùng trước khi chuyển ReLU
+- Reset khi bắt đầu 1 output pixel/output neuron mới
 
-### 2. PE Array (9 PE cố định)
+### 5. ReLU
+- So sánh với 0, giữ nguyên nếu dương
 
-**Chức năng:**
-- Nhận 1 cửa sổ 3×3 (9 giá trị input) và 1 kernel 3×3 (9 giá trị weight) cùng lúc
-- Thực hiện 9 phép nhân INT8×INT8 song song, sau đó cộng lại thành 1 giá trị partial sum (dùng adder tree, không cộng tuần tự để tránh delay dài)
+### 6. Quantizer
+- Nhân scale + dịch bit, clamp về INT8
+- Đọc `Scale`, `Shift` riêng theo từng layer từ AXI4-Lite config
 
-**Cần làm:**
-- 9 multiplier 8-bit×8-bit → kết quả 16-bit
-- Adder tree 3 tầng (9 input → gộp dần → 1 output), độ rộng kết quả đủ lớn để không tràn (tối thiểu 20-bit)
-- Thiết kế thuần tổ hợp (combinational) hoặc pipeline 1-2 tầng tùy yêu cầu tần số hoạt động
+### 7. Tiling Controller *(giai đoạn nâng cao)*
+- Chia feature map lớn thành tile vừa Input Buffer
+- Quản lý vùng overlap (halo) giữa các tile
+- Khuyến nghị tách module độc lập, giao tiếp qua địa chỉ/offset
 
-### 3. Channel Accumulator
+### 8. Top-level Controller FSM
+- State tối thiểu: `IDLE` → `LOAD_CONFIG` → `LOAD_WEIGHT` → `COMPUTE_TAP` (lặp 9 lần nếu Conv, 1 lần nếu FC) → `COMPUTE_CHANNEL_GROUP` (nếu cần time-multiplexing) → `DONE`
+- Biết chế độ đang chạy (Conv hay FC) để bật/tắt Line Buffer, số vòng lặp tap tương ứng
 
-**Chức năng:**
-- Cộng dồn partial sum từ PE Array qua từng input channel (vòng lặp `ic` trong `C_in`)
-- Khi xử lý xong toàn bộ input channel cho 1 output pixel, cộng thêm bias rồi chuyển kết quả sang ReLU
-- Hỗ trợ trường hợp tiling: nếu input channel bị chia nhỏ qua nhiều lượt xử lý (do tile), phải đọc lại partial sum đã lưu trước đó từ bộ nhớ ngoài, cộng thêm giá trị mới, rồi ghi lại (read-modify-write) thay vì chỉ cộng dồn trong thanh ghi nội bộ
+### 9. AXI4-Lite Config Interface
+- Thanh ghi: `K_size` (kernel size, hỗ trợ 1/3/5), `Stride`, `C_in`, `C_out`, `Scale`, `Shift`, `Pad_en`, `H`, `W`
+- Cấu hình trước khi kích hoạt `start` qua AXI4-Lite write
 
-**Cần làm:**
-- Thanh ghi tích lũy 32-bit, reset về 0 khi bắt đầu 1 output pixel mới (dựa theo bộ đếm `ic` chạy hết `cfg_c_in`)
-- Cộng bias ở bước cuối cùng của vòng lặp input channel
-- Interface đọc/ghi partial sum ra bộ nhớ ngoài cho trường hợp tiling (có thể làm ở giai đoạn sau, chưa cần ngay ở bản đầu tiên)
+### 10. AXI4-Stream Data Interface
+- 1 stream cho input activation, 1 stream cho weight, 1 stream cho output — mỗi stream có `TVALID/TREADY/TLAST/TDATA` theo chuẩn AXI4-Stream
 
-### 4. ReLU
+## Lộ trình triển khai
 
-**Chức năng:**
-- So sánh giá trị accumulator (sau khi cộng bias) với 0, giữ nguyên nếu dương, đưa về 0 nếu âm
-
-**Cần làm:**
-- 1 bộ so sánh (MSB check nếu dùng signed) + 1 mux chọn giữa giá trị gốc và 0
-- Đây là khối đơn giản nhất, có thể fuse chung tầng tổ hợp với accumulator để tiết kiệm 1 chu kỳ pipeline
-
-### 5. Quantizer
-
-**Chức năng:**
-- Chuyển kết quả 32-bit (sau ReLU) về lại INT8 bằng cách nhân với hệ số scale rồi dịch phải (shift) một số bit nhất định
-- Có clamp (giới hạn) giá trị output trong khoảng [-128, 127] hoặc [0, 255] tùy có dùng signed hay không, để tránh tràn số khi ép kiểu
-
-**Cần làm:**
-- 1 multiplier (32-bit × scale) + shifter (barrel shifter hoặc shift cố định nếu chấp nhận đơn giản hóa)
-- Logic clamp sau khi shift
-- Đọc `cfg_quant_scale` và `cfg_quant_shift` từ config interface — **khác nhau cho từng layer**, không hard-code
-
-### 6. Weight Buffer & Streaming
-
-**Chức năng:**
-- Lưu trọng số (kernel 3×3) của output channel đang xử lý trong buffer on-chip
-- Khi tổng weight của 1 layer vượt quá dung lượng buffer, nạp dần từng phần từ bộ nhớ ngoài qua `weight_valid/weight_ready/weight_data`
-- Double buffering: trong lúc PE Array đang tính với bộ weight hiện tại, nạp trước bộ weight cho lượt tính tiếp theo (ẩn thời gian chờ nạp weight phía sau thời gian tính toán)
-
-**Cần làm:**
-- Buffer đủ chứa ít nhất 1 bộ kernel 3×3×C_in cho 1 output channel (kích thước tùy `cfg_c_in`)
-- FSM quản lý 2 buffer (ping-pong), chuyển đổi khi 1 buffer đã nạp xong và buffer kia đang được dùng để tính
-- *(Có thể bỏ qua double buffering ở bản đầu tiên, dùng single buffer trước cho đơn giản, thêm sau nếu còn thời gian)*
-
-### 7. Data Reuse / Loop Order Controller
-
-**Chức năng:**
-- Quyết định thứ tự thực hiện 3 vòng lặp lồng nhau: output channel (`oc`) → vị trí pixel/tile (`oy, ox`) → input channel (`ic`)
-- Mục tiêu: giảm số lần đọc/ghi dữ liệu từ bộ nhớ ngoài bằng cách tái sử dụng dữ liệu đã có trong buffer càng nhiều càng tốt trước khi nạp dữ liệu mới
-
-**Cần làm:**
-- Ở bản đầu tiên: chọn 1 thứ tự cố định đơn giản (ví dụ: giữ input tile cố định, chạy hết các output channel trước khi chuyển tile tiếp theo — tái sử dụng input, nạp lại weight)
-- Ghi rõ trong tài liệu thiết kế lý do chọn thứ tự này, để phần đánh giá hiệu năng (báo cáo) có thể phân tích ưu/nhược điểm
-
-### 8. Tiling Controller
-
-**Chức năng:**
-- Chia feature map lớn hơn buffer on-chip thành các tile nhỏ, xử lý tuần tự từng tile
-- Tính vùng chồng lấp (halo) giữa các tile lân cận để pixel ở biên tile được tính đúng (cần dữ liệu từ tile kề bên)
-- Quản lý địa chỉ đọc input / ghi output tương ứng với vị trí tile trong toàn bộ feature map lớn
-
-**Cần làm:**
-- Bộ đếm vị trí tile hiện tại (tile_x, tile_y)
-- Logic tính offset đọc dữ liệu có overlap (đọc dư ra ngoài biên tile 1 pixel mỗi phía nếu không phải tile nằm ở rìa ảnh lớn)
-- *(Khuyến nghị: làm module này tách biệt độc lập với conv engine lõi, giao tiếp qua địa chỉ/offset, để verify riêng không làm phức tạp module tính toán chính)*
-
-### 9. Top-level Controller FSM
-
-**Chức năng:**
-- Điều phối toàn bộ pipeline: nhận config, chờ weight nạp xong, chạy vòng lặp tính toán, đồng bộ input/output stream
-- Đọc đúng tham số runtime (`cfg_c_in`, `cfg_c_out`, `cfg_h`, `cfg_w`...) thay vì cố định lúc thiết kế
-
-**Cần làm:**
-- State machine tối thiểu gồm các trạng thái: `IDLE` → `LOAD_CONFIG` → `LOAD_WEIGHT` → `COMPUTE` → `DONE`
-- Bộ đếm cho từng vòng lặp (`oc`, `oy`, `ox`, `ic`) đồng bộ với trạng thái `COMPUTE`
-- Xuất tín hiệu `busy`, `done` theo đúng thời điểm
-
-### 10. Config/Register Interface
-
-**Chức năng:**
-- Nhận và lưu giữ toàn bộ tham số cần thiết cho 1 lượt tính (1 layer hoặc 1 tile) trước khi bắt đầu
-
-**Cần làm:**
-- Thanh ghi lưu: `cfg_c_in`, `cfg_c_out`, `cfg_h`, `cfg_w`, `cfg_quant_scale`, `cfg_quant_shift`, `cfg_pad_en`
-- Handshake `cfg_valid/cfg_ready` để nạp config trước khi `start`
-
----
-
-**Gợi ý thứ tự làm việc thực tế:**
-
-1. Viết golden model Python trước (numpy, bit-accurate INT8) — dùng làm reference cho toàn bộ các bước sau
-2. RTL hóa khối 2 → 3 → 4 → 5 (PE Array → Accumulator → ReLU → Quantizer) và ghép test với 1 output pixel đơn lẻ trước, chưa cần buffer/FSM đầy đủ
-3. Thêm khối 1 (Line Buffer/Window) để tự động tạo input cho khối trên theo cả feature map
-4. Thêm khối 9 + 10 (Controller FSM + Config) để chạy tự động qua nhiều output channel, nhiều input channel
-5. Thêm khối 6 (Weight Streaming) khi weight vượt buffer
-6. Thêm khối 7, 8 (Loop order + Tiling) sau cùng — đây là phần nâng cao, có thể để làm ở giai đoạn 2 nếu thời gian hạn chế
+1. Golden model Python (numpy, bit-accurate INT8), mô phỏng cả đường Conv và đường FC dùng chung công thức MAC lặp tap
+2. RTL: 1 PE đơn (weight-stationary, giữ weight trong thanh ghi), verify phép nhân-cộng cơ bản
+3. RTL: MAC Array nhỏ (ví dụ 2×2), verify cơ chế song song hóa channel + accumulator qua vài tap giả lập
+4. Mở rộng MAC Array lên kích thước đầy đủ (4×4 hoặc 4×8)
+5. Weight Buffer (bắt đầu single buffer, thêm ping-pong sau)
+6. Line Buffer + Window Generator cho đường Conv, xác nhận bypass đúng khi chuyển sang FC
+7. ReLU + Quantizer
+8. Top-level FSM: chạy tự động qua tap loop (Conv) và single-pass (FC), qua toàn bộ layer của model CIFAR-10
+9. AXI4-Lite Config + AXI4-Stream Data Interface
+10. *(Nâng cao, tùy thời gian)* Tiling Controller cho feature map lớn hơn Input Buffer
 
 ## Công cụ & Flow
 
 - **RTL**: SystemVerilog
+- **Verification**: Testbench SystemVerilog, so khớp từng layer (cả Conv và FC) với golden model
+- **Golden model**: Python (PyTorch + NumPy)
+- **Tổng hợp mã nguồn mở**: Yosys, đánh giá area/timing với OpenROAD + SKY130 PDK
+
+## Trạng thái dự án
+
+- [ ] Golden model Python (Conv + FC)
+- [ ] RTL: PE đơn (weight-stationary)
+- [ ] RTL: MAC Array (channel-parallel)
+- [ ] RTL: Weight Buffer (single, sau đó ping-pong)
+- [ ] RTL: Line Buffer / Window Generator + bypass cho FC
+- [ ] RTL: pSum Accumulator (tap loop + channel time-multiplexing)
+- [ ] RTL: Quantizer
+- [ ] RTL: Top-level Controller FSM
+- [ ] Verification: so khớp golden model cho cả Conv và FC
+- [ ] AXI4-Lite Config Interface
+- [ ] AXI4-Stream Data Interface
+- [ ] RTL: Tiling Controller (nâng cao)
+- [ ] Tổng hợp thử Yosys/OpenROAD (SKY130)
+- [ ] Đánh giá hiệu năng: throughput, latency, PE utilization, ước lượng power/area
+
+## Cấu trúc thư mục
+
+```
+.
+├── rtl/                        # Mã nguồn SystemVerilog
+├── tb/                         # Testbench
+├── model/                      # Golden model Python, script train/quantize
+├── sim/                        # Script mô phỏng, kịch bản test
+├── synth/                      # Script tổng hợp Yosys/OpenROAD
+├── docs/
+│   └── explored/
+│       ├── 9pe-spatial/        # Phương án đầu tiên, giữ lại làm tài liệu so sánh
+│       └── systolic-gemm/      # Phương án Systolic + im2col + skew, giữ lại làm tài liệu so sánh
+└── README.md
+```
+
+## Tác giả
+
+Sinh viên ngành Kỹ thuật máy tính/Điện tử, hướng chuyên môn RTL Design & Verification.
