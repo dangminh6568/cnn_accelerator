@@ -26,20 +26,6 @@ FC2: 128 → 10 (classify)
 
 Model train bằng PyTorch, quantize về INT8 để khớp với engine phần cứng.
 
-## Quá trình đưa ra quyết định kiến trúc
-
-Dự án đã cân nhắc qua 3 hướng trước khi chốt phương án cuối:
-
-| Tiêu chí | 9-PE Spatial Convolver (thử đầu tiên) | Systolic Array 2D thuần / GEMM qua im2col (thử thứ hai) | **Channel-Parallel Weight-Stationary MAC Array (chốt)** |
-|---|---|---|---|
-| Khả năng chạy Conv 3×3 | Tốt | Rất tốt (qua im2col) | Rất tốt |
-| Khả năng chạy FC | **Liệt hoàn toàn** — gắn chết với cửa sổ 3×3 | Chạy được nhưng cần thêm biến đổi | Tận dụng 100% cùng phần cứng, không cần khối riêng |
-| Độ phức tạp FSM/control | Trung bình | Rất phức tạp (skewing, address generation) | Vừa phải, ánh xạ trực quan |
-| Hiệu suất sử dụng PE | 100% cho đúng 3×3, kém cho kernel khác | Thấp nếu C_in/C_out lẻ | Cao, linh hoạt theo kernel size |
-| Tối ưu năng lượng | Tốn công đọc line-buffer liên tục | Tối ưu truyền nội bộ nhưng phức tạp | Tối ưu nhờ weight-stationary (giảm truy xuất SRAM) |
-| Phù hợp quy mô IP core gọn (dễ timing closure trên SKY130) | Được | Quá cồng kềnh cho Edge AI | Phù hợp nhất |
-
-**Lý do chốt phương án 3**: đây là kiến trúc duy nhất giải quyết được đồng thời cả Conv và FC bằng chung 1 phần cứng, không phải trả giá về data duplication (im2col) hay độ phức tạp timing (skewing) như phương án Systolic-GEMM, đồng thời quy mô đủ gọn để khả thi tổng hợp/timing closure trong phạm vi đồ án. Chi tiết 2 phương án đã thử (bao gồm RTL của Systolic-GEMM + skew) được giữ lại tại `docs/explored/` làm tài liệu so sánh.
 
 ## Kiến trúc
 
