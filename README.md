@@ -1,13 +1,12 @@
 # CNN Accelerator IP Core (RTL)
 
-IP core phần cứng tăng tốc tính toán cho mạng CNN (Conv + Fully-Connected), thiết kế bằng SystemVerilog, hướng đến Edge AI/NPU cỡ nhỏ. Lõi tính toán dùng chung 1 mảng MAC cho cả lớp Conv lẫn FC, giao tiếp qua chuẩn AXI4.
+IP core phần cứng tăng tốc tính toán cho mạng CNN (Conv), thiết kế bằng SystemVerilog, hướng đến Edge AI/NPU cỡ nhỏ. Lõi tính toán dùng 1 mảng MAC cho lớp Conv , giao tiếp qua chuẩn AXI4.
 
 ## Mục tiêu
 
-Thiết kế một **MAC Array song song hóa theo channel, weight-stationary**, dùng chung cho cả Convolution và Fully-Connected — không cần 2 khối phần cứng riêng biệt:
+Thiết kế một **MAC Array song song hóa theo channel, weight-stationary**:
 
 - Xử lý Conv 3×3 (và mở rộng được cho kernel size khác) với C_in/C_out tùy chỉnh runtime
-- Xử lý FC layer bằng chính mảng MAC đó (FC = trường hợp đặc biệt của conv với kernel size 1)
 - Tận dụng nguyên lý weight-stationary để giảm năng lượng đọc SRAM (đọc SRAM tốn năng lượng gấp nhiều lần so với 1 phép nhân 8-bit)
 - Giao tiếp chuẩn hóa qua AXI4-Lite (config) và AXI4-Stream (data/weight/output)
 
@@ -61,7 +60,7 @@ Mảng MAC **4×4 hoặc 4×8** (INT8) — quy mô đủ nhỏ để khả thi �
 Input Buffer (SRAM 2-port, layout NHWC/CHW) ──┐
                                                 ▼
 Line Buffer & Window Generator (Conv) ─── MAC Array (M×N, weight-stationary)
-   (bỏ qua/bypass khi chạy FC)                 │
+                                                │
                                                 ▼
 Weight Buffer (Ping-Pong SRAM) ──────►    pSum Accumulator
                                                 │
@@ -75,8 +74,8 @@ Weight Buffer (Ping-Pong SRAM) ──────►    pSum Accumulator
 | Khối | Chức năng |
 |---|---|
 | Input Buffer (SRAM 2-port) | Lưu feature map/activation theo layout channel (NHWC hoặc CHW tùy bus width) |
-| Line Buffer & Window Generator | Sinh cửa sổ 3×3×C_in mỗi bước cho Conv; bypass khi chạy FC (input đọc thẳng dạng vector) |
-| MAC Array (M×N, weight-stationary) | Lõi tính toán dùng chung cho Conv và FC, lặp tuần tự theo tap kernel |
+| Line Buffer & Window Generator | Sinh cửa sổ 3×3×C_in mỗi bước cho Conv |
+| MAC Array (M×N, weight-stationary) | Lõi tính toán dùng cho Conv lặp tuần tự theo tap kernel |
 | Weight Buffer (Ping-Pong) | Chứa block weight INT8, double buffering để nạp trước weight lượt kế tiếp |
 | pSum Accumulator | Cộng dồn qua các tap kernel và các lượt time-multiplexing channel |
 | ReLU | Cắt giá trị âm |
@@ -92,13 +91,12 @@ Weight Buffer (Ping-Pong SRAM) ──────►    pSum Accumulator
 - Mỗi PE: 1 multiplier INT8×INT8 + 1 adder, giữ 1 giá trị weight cố định trong thanh ghi nội bộ suốt 1 lượt tính (nạp qua Weight Loading Path trước khi compute)
 - Input broadcast/shift tới các PE theo hàng hoặc cột tùy ánh xạ (không cần skew phức tạp như thiết kế systolic-GEMM)
 - Với Conv: lặp 9 lần (từng tap kernel 3×3), mỗi lần dùng 1 bộ weight khác nạp vào PE, cộng dồn vào pSum Accumulator
-- Với FC: chạy 1 lượt duy nhất, kernel size = 1, dùng chung accumulator
 
 ### 2. Weight Buffer (Ping-Pong)
 - 2 buffer luân phiên: buffer A đang cấp weight cho MAC Array tính, buffer B nạp trước weight của tap/lượt kế tiếp từ AXI4-Stream
 - Giảm thời gian chờ giữa các lượt tap/channel
 
-### 3. Line Buffer & Window Generator (chỉ dùng cho Conv)
+### 3. Line Buffer & Window Generator (dùng cho Conv)
 - Giữ 3 hàng feature map, sinh cửa sổ 3×3×C_in mỗi bước
 - Xử lý padding biên theo `Pad_en`
 - Bypass khối này khi FSM ở chế độ FC (input đọc thẳng từ Input Buffer dạng vector, không cần cửa sổ trượt)
@@ -121,8 +119,7 @@ Weight Buffer (Ping-Pong SRAM) ──────►    pSum Accumulator
 - Khuyến nghị tách module độc lập, giao tiếp qua địa chỉ/offset
 
 ### 8. Top-level Controller FSM
-- State tối thiểu: `IDLE` → `LOAD_CONFIG` → `LOAD_WEIGHT` → `COMPUTE_TAP` (lặp 9 lần nếu Conv, 1 lần nếu FC) → `COMPUTE_CHANNEL_GROUP` (nếu cần time-multiplexing) → `DONE`
-- Biết chế độ đang chạy (Conv hay FC) để bật/tắt Line Buffer, số vòng lặp tap tương ứng
+- State tối thiểu: `IDLE` → `LOAD_CONFIG` → `LOAD_WEIGHT` → `COMPUTE_TAP` → `COMPUTE_CHANNEL_GROUP` (nếu cần time-multiplexing) → `DONE`
 
 ### 9. AXI4-Lite Config Interface
 - Thanh ghi: `K_size` (kernel size, hỗ trợ 1/3/5), `Stride`, `C_in`, `C_out`, `Scale`, `Shift`, `Pad_en`, `H`, `W`
@@ -133,14 +130,14 @@ Weight Buffer (Ping-Pong SRAM) ──────►    pSum Accumulator
 
 ## Lộ trình triển khai
 
-1. Golden model Python (numpy, bit-accurate INT8), mô phỏng cả đường Conv và đường FC dùng chung công thức MAC lặp tap
+1. Golden model Python (numpy, bit-accurate INT8), 
 2. RTL: 1 PE đơn (weight-stationary, giữ weight trong thanh ghi), verify phép nhân-cộng cơ bản
 3. RTL: MAC Array nhỏ (ví dụ 2×2), verify cơ chế song song hóa channel + accumulator qua vài tap giả lập
 4. Mở rộng MAC Array lên kích thước đầy đủ (4×4 hoặc 4×8)
 5. Weight Buffer (bắt đầu single buffer, thêm ping-pong sau)
 6. Line Buffer + Window Generator cho đường Conv, xác nhận bypass đúng khi chuyển sang FC
 7. ReLU + Quantizer
-8. Top-level FSM: chạy tự động qua tap loop (Conv) và single-pass (FC), qua toàn bộ layer của model CIFAR-10
+8. Top-level FSM: chạy tự động qua tap loop (Conv)  qua toàn bộ layer conv của model CIFAR-10
 9. AXI4-Lite Config + AXI4-Stream Data Interface
 10. *(Nâng cao, tùy thời gian)* Tiling Controller cho feature map lớn hơn Input Buffer
 
@@ -153,15 +150,15 @@ Weight Buffer (Ping-Pong SRAM) ──────►    pSum Accumulator
 
 ## Trạng thái dự án
 
-- [ ] Golden model Python (Conv + FC)
+- [ ] Golden model Python (Conv)
 - [ ] RTL: PE đơn (weight-stationary)
 - [ ] RTL: MAC Array (channel-parallel)
 - [ ] RTL: Weight Buffer (single, sau đó ping-pong)
-- [ ] RTL: Line Buffer / Window Generator + bypass cho FC
+- [ ] RTL: Line Buffer / Window Generator
 - [ ] RTL: pSum Accumulator (tap loop + channel time-multiplexing)
 - [ ] RTL: Quantizer
 - [ ] RTL: Top-level Controller FSM
-- [ ] Verification: so khớp golden model cho cả Conv và FC
+- [ ] Verification: so khớp golden model cho Conv
 - [ ] AXI4-Lite Config Interface
 - [ ] AXI4-Stream Data Interface
 - [ ] RTL: Tiling Controller (nâng cao)
@@ -178,9 +175,6 @@ Weight Buffer (Ping-Pong SRAM) ──────►    pSum Accumulator
 ├── sim/                        # Script mô phỏng, kịch bản test
 ├── synth/                      # Script tổng hợp Yosys/OpenROAD
 ├── docs/
-│   └── explored/
-│       ├── 9pe-spatial/        # Phương án đầu tiên, giữ lại làm tài liệu so sánh
-│       └── systolic-gemm/      # Phương án Systolic + im2col + skew, giữ lại làm tài liệu so sánh
 └── README.md
 ```
 
