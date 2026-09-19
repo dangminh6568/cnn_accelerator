@@ -49,7 +49,6 @@ Weight Reg -- | PE(M,0)   PE(M,1)   ...    PE(M,N)    | ---> pSum Accumulator (o
 - **Chiều M (hàng)**: song song hóa theo **output channel** (`C_out`)
 - **Chiều N (cột)**: song song hóa theo **input channel** (`C_in`) hoặc spatial pixel, tùy giai đoạn
 - **Weight-stationary**: mỗi PE giữ cố định 1 giá trị weight trong thanh ghi nội bộ suốt 1 lượt tính; input (activation) được truyền quét qua mảng để nhân với các weight này — 1 giá trị input được tái sử dụng đồng thời cho nhiều output channel (giảm mạnh số lần đọc SRAM)
-- **Kernel 3×3 xử lý bằng cách lặp tuần tự 9 tap**: với mỗi vị trí kernel (kx, ky) trong 9 tap, nạp bộ weight tương ứng, chạy 1 lượt qua mảng, cộng dồn kết quả vào accumulator — sau 9 lượt, output pixel hoàn tất. Với FC (kernel size = 1), chỉ cần 1 lượt duy nhất, dùng chung mảng và accumulator này.
 - Nếu `C_in`/`C_out` của layer lớn hơn kích thước vật lý M×N của mảng, chạy nhiều lượt tuần tự (time-multiplexing), cộng dồn thêm vào accumulator.
 
 ### Kích thước mảng đề xuất
