@@ -90,8 +90,7 @@ Mọi giá trị ngoài phạm vi trên coi là **không được định nghĩa
 
 ### 2.1 Nguyên lý dataflow
 
-- **Weight-stationary trong 1 tap**: tại mỗi vòng lặp (ky, kx, cin_tile), một khối trọng số CIN_TILE×COUT_TILE được nạp vào PE array và giữ nguyên trong 1 chu kỳ compute.
-- **Output-stationary trong 1 pixel**: accumulator giữ kết quả cho đến khi quét hết toàn bộ kernel taps + cin_tiles của điểm output đó, rồi mới post-process và đẩy ra.
+- **Kiến trúc này là Output-Stationary (OS) thuần túy**: accumulator (ứng với 1 vị trí output tại pixel×cout_tile) được giữ cố định và tích lũy kết quả trong suốt toàn bộ vòng lặp kernel taps + cin_tiles. Weight và activation được đọc mới hoàn toàn ở mỗi tap và không được giữ lại để tái sử dụng qua các cycle kế tiếp — vì vậy thiết kế **không** có yếu tố weight-stationary (khác với kiến trúc WS, nơi 1 weight được nạp 1 lần rồi dùng cho nhiều activation liên tiếp trước khi đổi weight).
 - **Streaming theo từng pixel** (không tile theo không gian): nhờ line buffer chỉ giữ K dòng gần nhất, không cần buffer toàn bộ feature map → tiết kiệm bộ nhớ, và không phát sinh vấn đề "kích thước không chia hết cho PE array" ở chiều không gian.
 
 ### 2.2 Vòng lặp tính toán (pseudocode tham chiếu)
@@ -238,7 +237,7 @@ Giao diện ghi/đọc đơn giản kiểu APB-lite: `cfg_addr[7:0]`, `cfg_wdata
   ```
   product[i][j] = act[i] * weight[i][j]     # i = 0..CIN_TILE-1, j = 0..COUT_TILE-1
   ```
-- **Wiring:** `act[i]` broadcast theo hàng `i` cho toàn bộ COUT_TILE cột; `weight[i][j]` cố định tại từng PE (không dịch chuyển — khác với systolic array chuyển dữ liệu, ở đây dữ liệu chỉ broadcast + tính tại chỗ, đơn giản hóa control).
+- **Wiring:** `act[i]` broadcast theo hàng `i` cho toàn bộ COUT_TILE cột; `weight[i][j]` được nạp đúng vào vị trí PE(i,j) cho tile hiện tại và chỉ dùng trong đúng 1 cycle MAC của tap đó — **không** giữ lại cho tap kế tiếp (không phải weight-stationary). Khác với systolic array vốn dịch chuyển dữ liệu qua từng PE theo từng cycle, ở đây dữ liệu chỉ broadcast + tính tại chỗ trong 1 cycle, giúp đơn giản hóa control.
 
 ### 5.6 Adder Tree
 
